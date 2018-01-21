@@ -1,11 +1,15 @@
 import io
 import json
 import time
+import atexit
+import aiohttp
 import asyncio
 import traceback
 import collections
+import async_timeout
 from concurrent.futures._base import CancelledError
 from . import helper, api
+from ..api import _methodurl, _fileurl
 from .. import (
     _BotBase, flavor, _find_first_key, _isstring, _strip, _rectify,
     _dismantle_message_identifier, _split_input_media_array
@@ -46,11 +50,13 @@ class Bot(_BotBase):
         def cancel(self, event):
             return event.cancel()
 
-    def __init__(self, token, loop=None):
+    def __init__(self, token, loop=None, session=None, timeout=30):
         super(Bot, self).__init__(token)
 
         self._loop = loop or asyncio.get_event_loop()
-        api._loop = self._loop  # sync loop with api module
+        self.refresh_session(session)
+        self._timeout = timeout
+        atexit.register(self.close)
 
         self._scheduler = self.Scheduler(self._loop)
 
@@ -58,6 +64,24 @@ class Bot(_BotBase):
                                               'callback_query': helper._create_invoker(self, 'on_callback_query'),
                                               'inline_query': helper._create_invoker(self, 'on_inline_query'),
                                               'chosen_inline_result': helper._create_invoker(self, 'on_chosen_inline_result')})
+
+    def refresh_session(self, session=None):
+
+        if session and not session.closed:
+            self.session = session
+            return
+
+        self.session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=10),
+            loop=self._loop
+        )
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        if not self.session.closed:
+            self.session.close()
 
     @property
     def loop(self):
@@ -74,8 +98,58 @@ class Bot(_BotBase):
     async def handle(self, msg):
         await self._router.route(msg)
 
+    def _compose_timeout(self, req):
+        token, method, params, files = req
+
+        if method == 'getUpdates' and params and 'timeout' in params:
+            # Ensure HTTP timeout is longer than getUpdates timeout
+            return params['timeout'] + self._timeout
+        elif files:
+            # Disable timeout if uploading files. For some reason, the larger the file,
+            # the longer it takes for the server to respond (after upload is finished).
+            # It is unclear how long timeout should be.
+            return None
+        else:
+            return self._timeout
+
+    def _transform(self, req, **user_kw):
+        timeout = api._compose_timeout(req)
+        data = api._compose_data(req)
+        url = _methodurl(req, **user_kw)
+
+        kwargs = {'data': data}
+        kwargs.update(user_kw)
+        if self.session.closed:
+            self.refresh_session()
+
+        return self.session.post, (url,), kwargs, timeout
+
+    async def request(self, req, **user_kw):
+        fn, args, kwargs, timeout = self._transform(req, **user_kw)
+
+        if api._proxy:
+            kwargs['proxy'] = api._proxy[0]
+            if len(api._proxy) > 1:
+                kwargs['proxy_auth'] = aiohttp.BasicAuth(*api._proxy[1])
+
+        try:
+            if timeout is None:
+                async with fn(*args, **kwargs) as r:
+                    return await api._parse(r)
+            else:
+                try:
+                    with async_timeout.timeout(timeout):
+                        async with fn(*args, **kwargs) as r:
+                            return await api._parse(r)
+
+                except asyncio.TimeoutError:
+                    raise exception.TelegramError('Response timeout', 504, {})
+
+        except aiohttp.ClientConnectionError:
+            raise exception.TelegramError('Connection Error', 400, {})
+
     async def _api_request(self, method, params=None, files=None, **kwargs):
-        return await api.request((self._token, method, params, files), **kwargs)
+        return await self.request((self._token, method, params, files), **kwargs)
 
     async def _api_request_with_file(self, method, params, file_key, file_value, **kwargs):
         if _isstring(file_value):
@@ -615,6 +689,12 @@ class Bot(_BotBase):
         p.update(_dismantle_message_identifier(game_message_identifier))
         return await self._api_request('getGameHighScores', _rectify(p))
 
+    def download(self, req):
+        session = aiohttp.ClientSession(
+               connector=aiohttp.TCPConnector(limit=1, force_close=True),
+               loop=self._loop)
+        return session, session.get(_fileurl(req), timeout=self._timeout)
+
     async def download_file(self, file_id, dest):
         """
         Download a file to local disk.
@@ -626,7 +706,7 @@ class Bot(_BotBase):
         try:
             d = dest if isinstance(dest, io.IOBase) else open(dest, 'wb')
 
-            session, request = api.download((self._token, f['file_path']))
+            session, request = self.download((self._token, f['file_path']))
 
             async with session:
                 async with request as r:

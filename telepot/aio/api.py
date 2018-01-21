@@ -1,21 +1,9 @@
-import asyncio
 import aiohttp
-import async_timeout
-import atexit
 import re
 import json
 from .. import exception
-from ..api import _methodurl, _which_pool, _fileurl, _guess_filename
+from ..api import _guess_filename
 
-_loop = asyncio.get_event_loop()
-
-_pools = {
-    'default': aiohttp.ClientSession(
-                   connector=aiohttp.TCPConnector(limit=10),
-                   loop=_loop)
-}
-
-_timeout = 30
 _proxy = None  # (url, (username, password))
 
 def set_proxy(url, basic_auth=None):
@@ -25,36 +13,7 @@ def set_proxy(url, basic_auth=None):
     else:
         _proxy = (url, basic_auth) if basic_auth else (url,)
 
-def _close_pools():
-    global _pools
-    for s in _pools.values():
-        s.close()
-
-atexit.register(_close_pools)
-
-def _create_onetime_pool():
-    return aiohttp.ClientSession(
-               connector=aiohttp.TCPConnector(limit=1, force_close=True),
-               loop=_loop)
-
-def _default_timeout(req, **user_kw):
-    return _timeout
-
-def _compose_timeout(req, **user_kw):
-    token, method, params, files = req
-
-    if method == 'getUpdates' and params and 'timeout' in params:
-        # Ensure HTTP timeout is longer than getUpdates timeout
-        return params['timeout'] + _default_timeout(req, **user_kw)
-    elif files:
-        # Disable timeout if uploading files. For some reason, the larger the file,
-        # the longer it takes for the server to respond (after upload is finished).
-        # It is unclear how long timeout should be.
-        return None
-    else:
-        return _default_timeout(req, **user_kw)
-
-def _compose_data(req, **user_kw):
+def _compose_data(req):
     token, method, params, files = req
 
     data = aiohttp.FormData()
@@ -76,27 +35,6 @@ def _compose_data(req, **user_kw):
             data.add_field(key, fileobj, filename=filename)
 
     return data
-
-def _transform(req, **user_kw):
-    timeout = _compose_timeout(req, **user_kw)
-
-    data = _compose_data(req, **user_kw)
-
-    url = _methodurl(req, **user_kw)
-
-    name = _which_pool(req, **user_kw)
-
-    if name is None:
-        session = _create_onetime_pool()
-        cleanup = session.close  # one-time session: remember to close
-    else:
-        session = _pools[name]
-        cleanup = None  # reuse: do not close
-
-    kwargs = {'data':data}
-    kwargs.update(user_kw)
-
-    return session.post, (url,), kwargs, timeout, cleanup
 
 async def _parse(response):
     try:
@@ -121,35 +59,3 @@ async def _parse(response):
         # ... or raise generic error
         raise exception.TelegramError(description, error_code, data)
 
-async def request(req, **user_kw):
-    fn, args, kwargs, timeout, cleanup = _transform(req, **user_kw)
-
-    if _proxy:
-        kwargs['proxy'] = _proxy[0]
-        if len(_proxy) > 1:
-            kwargs['proxy_auth'] = aiohttp.BasicAuth(*_proxy[1])
-
-    try:
-        if timeout is None:
-            async with fn(*args, **kwargs) as r:
-                return await _parse(r)
-        else:
-            try:
-                with async_timeout.timeout(timeout):
-                    async with fn(*args, **kwargs) as r:
-                        return await _parse(r)
-
-            except asyncio.TimeoutError:
-                raise exception.TelegramError('Response timeout', 504, {})
-
-    except aiohttp.ClientConnectionError:
-        raise exception.TelegramError('Connection Error', 400, {})
-
-    finally:
-        if cleanup:
-            cleanup()  # e.g. closing one-time session
-
-def download(req):
-    session = _create_onetime_pool()
-    return session, session.get(_fileurl(req), timeout=_timeout)
-    # Caller should close session after download is complete
