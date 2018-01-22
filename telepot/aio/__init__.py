@@ -113,7 +113,7 @@ class Bot(_BotBase):
             return self._timeout
 
     def _transform(self, req, **user_kw):
-        timeout = api._compose_timeout(req)
+        timeout = self._compose_timeout(req)
         data = api._compose_data(req)
         url = _methodurl(req, **user_kw)
 
